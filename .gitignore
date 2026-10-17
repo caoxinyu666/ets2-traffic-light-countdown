@@ -1,0 +1,13 @@
+/originals/
+/sources/
+/source/
+/plugins/build/
+/third_party/deps/
+/ETS2_Traffic_Light_Timer_1.61.scs
+/tools/build.py
+/tools/uniform_cycle.py
+/tools/verify.py
+*.bak
+*.pdb
+*.o
+*.lib
