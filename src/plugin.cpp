@@ -43,7 +43,6 @@ WNDPROC oldProc = nullptr;
 ImGuiContext* ui = nullptr;
 std::atomic<bool> stopping{false};
 bool panel = false, settingsHeld = false, f11Held = false;
-bool redHeld = false, greenHeld = false, clearHeld = false;
 std::atomic<bool> captureMouse{false};
 std::atomic<int> wheelDelta{0};
 PanelInput panelInput;
@@ -107,22 +106,14 @@ void log(const char* s) { if (logger) logger(SCS_LOG_TYPE_message, s); }
 // ---- 设置 ----
 struct Settings {
     bool enabled = true;
-    double green = 30, yellow = 4, red = 25, yellow2 = 4;
     float x = 0.5f, y = 0.07f, font = 24, opacity = 1;
     float detectionDistance = 250;
     int key = VK_BACK, hideKey = VK_F11;
     bool keyCtrl = true, keyShift = true;
-    double cycle() const { return green + yellow + red + yellow2; }
 } settings;
 
 // 驾驶期间累计的真实秒数。没有同步点时绝不显示推算的灯色。
-double realClock = 0;
 enum Light { LightGreen, LightYellow, LightRed, LightYellow2 };
-bool synchronizedLight = false;
-double synchronizedAt = 0;
-double synchronizedPhase = 0;
-double distanceSinceSync = 0;
-constexpr double kClearDistance = 120.0;
 
 struct LiveLight {
     Light light;
@@ -148,13 +139,9 @@ LiveLight findLiveLight(double x, double z, double heading) {
         const double dx = r.x - x, dz = r.z - z;
         const double ahead = dx * forwardX + dz * forwardZ;
         const double lateral = std::abs(dx * forwardZ - dz * forwardX);
-        // The telemetry position is the truck's origin, while signal actors can
-        // sit beside or just behind the cab when stopped at a junction.
-        const double lateralLimit = std::min(38.0, 22.0 + std::max(0.0, ahead) * 0.08);
-        if (ahead < -8 || ahead > settings.detectionDistance || lateral > lateralLimit) continue;
-        // Keep a lamp behind the truck only while it is still at the stop line.
-        if (ahead < 0 && std::hypot(dx, dz) > 28.0) continue;
-        const double score = std::max(0.0, ahead) + lateral * 2 + (ahead < 0 ? 20.0 : 0.0);
+        const double lateralLimit = std::min(30.0, std::max(18.0, ahead * 0.12));
+        if (ahead < 2 || ahead > settings.detectionDistance || lateral > lateralLimit) continue;
+        const double score = ahead + lateral * 2;
         if (score < bestScore) {
             bestScore = score;
             best = {r.state == 8 ? LightGreen : (r.state == 2 ? LightRed : LightYellow),
@@ -174,15 +161,6 @@ float readFloat(const wchar_t* name, float def) {
     const float value = wcstof(buffer, &end);
     return end != buffer && std::isfinite(value) ? value : def;
 }
-double readCycle(const wchar_t* name, double def) {
-    wchar_t buffer[64];
-    GetPrivateProfileStringW(L"Cycle", name, L"", buffer, 64, iniPath.c_str());
-    if (!*buffer) return def;
-    wchar_t* end = nullptr;
-    const double value = wcstod(buffer, &end);
-    return end != buffer && std::isfinite(value) ? value : def;
-}
-
 void loadSettings() {
     settings.enabled = readInt(L"Display", L"Enabled", 1) != 0;
     settings.x = std::clamp(readFloat(L"X", 0.5f), 0.05f, 0.95f);
@@ -194,10 +172,6 @@ void loadSettings() {
     settings.keyCtrl = readInt(L"Hotkeys", L"SettingsCtrl", 1) != 0;
     settings.keyShift = readInt(L"Hotkeys", L"SettingsShift", 1) != 0;
     settings.hideKey = std::clamp(readInt(L"Hotkeys", L"Toggle", VK_F11), 1, 254);
-    settings.green = std::max(1.0, readCycle(L"Green", 30));
-    settings.yellow = std::max(0.0, readCycle(L"Yellow", 4));
-    settings.red = std::max(1.0, readCycle(L"Red", 25));
-    settings.yellow2 = std::max(0.0, readCycle(L"Yellow2", 4));
 }
 
 void saveSettings() {
@@ -215,43 +189,6 @@ void saveSettings() {
     number(L"Display", L"FontSize", settings.font);
     number(L"Display", L"Opacity", settings.opacity);
     number(L"Display", L"DetectionDistance", settings.detectionDistance);
-    number(L"Cycle", L"Green", settings.green);
-    number(L"Cycle", L"Yellow", settings.yellow);
-    number(L"Cycle", L"Red", settings.red);
-    number(L"Cycle", L"Yellow2", settings.yellow2);
-}
-
-// ---- 相位推算 ----
-struct Phase {
-    Light light = LightGreen;
-    double remaining = 0;   // 当前相位还剩多少秒（游戏时间）
-    double elapsed = 0;     // 当前相位已过去多少秒
-};
-
-// 把「周期内某一时刻」映射成灯色与剩余时间。
-Phase phaseAt(double secondsIntoCycle) {
-    const double cycle = settings.cycle();
-    double t = fmod(secondsIntoCycle, cycle);
-    if (t < 0) t += cycle;
-    Phase result;
-    if (t < settings.green) {
-        result.light = LightGreen;
-        result.remaining = settings.green - t;
-        result.elapsed = t;
-    } else if (t < settings.green + settings.yellow) {
-        result.light = LightYellow;
-        result.remaining = settings.green + settings.yellow - t;
-        result.elapsed = t - settings.green;
-    } else if (t < settings.green + settings.yellow + settings.red) {
-        result.light = LightRed;
-        result.remaining = settings.green + settings.yellow + settings.red - t;
-        result.elapsed = t - settings.green - settings.yellow;
-    } else {
-        result.light = LightYellow2;
-        result.remaining = cycle - t;
-        result.elapsed = t - settings.green - settings.yellow - settings.red;
-    }
-    return result;
 }
 
 const char* lightName(Light light) {
@@ -362,17 +299,14 @@ void drawHUD() {
     const float scale = io.DisplaySize.y / 972.f;
     const float fontSize = settings.font * scale;
 
-    Phase current = phaseAt(synchronizedPhase + realClock - synchronizedAt);
-    if (currentLive.valid) {
-        current.light = currentLive.light;
-        current.remaining = currentLive.remaining;
-    }
+    const Light light = currentLive.light;
+    const double remaining = currentLive.remaining;
 
     // 文本
     char mainText[64];
-    snprintf(mainText, sizeof(mainText), "%s  还剩 %s 秒", lightName(current.light),
-             seconds(std::ceil(current.remaining)).c_str());
-    const char* subText = currentLive.valid ? "游戏实时信号灯" : "手动同步 · F7 清除";
+    snprintf(mainText, sizeof(mainText), "%s  还剩 %s 秒", lightName(light),
+             seconds(std::ceil(remaining)).c_str());
+    const char* subText = "游戏实时信号灯";
 
     auto* font = ImGui::GetFont();
     const float lineHeight = fontSize * 1.45f;
@@ -395,7 +329,7 @@ void drawHUD() {
 
     const float cx = left + pad + dot;
     const float cy = top + pad + fontSize * 0.62f;
-    draw->AddCircleFilled({cx, cy}, dot, lightColor(current.light, alpha));
+    draw->AddCircleFilled({cx, cy}, dot, lightColor(light, alpha));
     draw->AddCircle({cx, cy}, dot, IM_COL32(255, 255, 255, static_cast<int>(120 * settings.opacity)),
                     20, std::max(1.f, fontSize / 14));
     draw->AddText(font, fontSize, {left + pad + dot * 2 + fontSize * 0.4f, top + pad},
@@ -413,26 +347,13 @@ void drawSettings() {
     ImGui::Begin("信号灯倒计时设置", &panel);
     ImGui::SetWindowFontScale(0.8f);
     if (focusPanel) { ImGui::SetWindowFocus(); focusPanel = false; }
-    ImGui::TextUnformatted("F8：红灯刚亮  F9：绿灯刚亮  F7：清除");
     ImGui::TextUnformatted("Ctrl+Shift+Backspace：关闭面板  F11：显示 / 隐藏");
     ImGui::Text("游戏信号灯读取：%s", signalReaderReady ? "已启用" : "此版本不支持");
-    ImGui::TextWrapped("检测到前方信号灯时自动显示真实倒计时。"
-                       "没有该数据时，可在看到灯刚变色时按 F8/F9 手动同步；驶离约 120 米后清除。");
+    ImGui::TextWrapped("仅在检测到前方信号灯时显示游戏内剩余时间。");
 
     changed |= ImGui::Checkbox("启用倒计时", &settings.enabled);
     changed |= ImGui::SliderFloat("识别距离（米）", &settings.detectionDistance, 100, 400, "%.0f 米");
     ImGui::TextWrapped("距离设得越远，复杂路口越可能选到邻近道路的灯。");
-    ImGui::Separator();
-    ImGui::TextUnformatted("周期设置（秒）—— 必须与配套 .scs 一致");
-    auto duration = [&](const char* name, double& value, float min, float max) {
-        float temp = static_cast<float>(value);
-        if (ImGui::SliderFloat(name, &temp, min, max, "%.0f")) { value = temp; changed = true; }
-    };
-    duration("绿灯", settings.green, 5, 90);
-    duration("黄灯", settings.yellow, 0, 10);
-    duration("红灯", settings.red, 5, 90);
-    duration("黄灯（红后）", settings.yellow2, 0, 10);
-    ImGui::Text("当前周期：%.0f 秒", settings.cycle());
     ImGui::Separator();
     changed |= ImGui::SliderFloat("水平位置", &settings.x, 0.05f, 0.95f, "%.3f");
     changed |= ImGui::SliderFloat("垂直位置", &settings.y, 0.f, 0.9f, "%.3f");
@@ -466,25 +387,6 @@ HRESULT WINAPI hookedPresent(IDXGISwapChain* chain, UINT sync, UINT flags) {
                 pressed = foreground && (GetAsyncKeyState(settings.hideKey) & 0x8000);
                 if (pressed && !f11Held) { settings.enabled = !settings.enabled; saveSettings(); }
                 f11Held = pressed;
-                pressed = foreground && !panel && (GetAsyncKeyState(VK_F8) & 0x8000);
-                if (pressed && !redHeld) {
-                    synchronizedLight = true;
-                    synchronizedAt = realClock;
-                    synchronizedPhase = settings.green + settings.yellow;
-                    distanceSinceSync = 0;
-                }
-                redHeld = pressed;
-                pressed = foreground && !panel && (GetAsyncKeyState(VK_F9) & 0x8000);
-                if (pressed && !greenHeld) {
-                    synchronizedLight = true;
-                    synchronizedAt = realClock;
-                    synchronizedPhase = 0;
-                    distanceSinceSync = 0;
-                }
-                greenHeld = pressed;
-                pressed = foreground && !panel && (GetAsyncKeyState(VK_F7) & 0x8000);
-                if (pressed && !clearHeld) synchronizedLight = false;
-                clearHeld = pressed;
                 if (panel && foreground && (GetAsyncKeyState(VK_ESCAPE) & 0x8000)) panel = false;
 
                 ID3D11Texture2D* back = nullptr;
@@ -543,23 +445,15 @@ HRESULT WINAPI hookedPresent(IDXGISwapChain* chain, UINT sync, UINT flags) {
                     ImGui_ImplDX11_NewFrame();
                     ImGui::NewFrame();
                     bool isDriving = false;
-                    double speed = 0, x = 0, z = 0, heading = 0;
+                    double x = 0, z = 0, heading = 0;
                     bool positionValid = false;
                     { std::lock_guard<std::mutex> lock(clockMutex);
-                        isDriving = driving; speed = truckSpeed;
+                        isDriving = driving;
                         x = truckX; z = truckZ; heading = truckHeading;
                         positionValid = truckPositionValid;
                     }
-                    if (isDriving) {
-                        realClock += elapsed;
-                        if (synchronizedLight) {
-                            distanceSinceSync += speed * elapsed;
-                            if (distanceSinceSync >= kClearDistance) synchronizedLight = false;
-                        }
-                    }
                     currentLive = isDriving && positionValid ? findLiveLight(x, z, heading) : LiveLight{};
-                    if (currentLive.valid) synchronizedLight = false;
-                    if (settings.enabled && isDriving && (currentLive.valid || synchronizedLight)) drawHUD();
+                    if (settings.enabled && isDriving && currentLive.valid) drawHUD();
                     if (panel) drawSettings();
                     if (!panel && captureMouse) { captureMouse = false; panelInput.stop(); }
                     ImGui::Render();
@@ -654,9 +548,7 @@ extern "C" SCSAPI_RESULT scs_telemetry_init(scs_u32_t version, const scs_telemet
     iniPath = iniPath.substr(0, iniPath.find_last_of(L'.')) + L".ini";
     loadSettings();
     stopping = false;
-    synchronizedLight = false;
     currentLive = {};
-    realClock = 0;
     signalReaderReady = signalReader.initialize();
     log(signalReaderReady ? "[TrafficTimer] Native signal reader ready."
                           : "[TrafficTimer] Game signal patterns not found; automatic countdown disabled.");
@@ -678,7 +570,7 @@ extern "C" SCSAPI_RESULT scs_telemetry_init(scs_u32_t version, const scs_telemet
                        SCS_TELEMETRY_EVENT_frame_end})
         p->register_for_event(event, onEvent, nullptr);
 
-    log("[TrafficTimer] Loaded. F8=red transition, F9=green transition, F7=clear.");
+    log("[TrafficTimer] Loaded. Automatic signal countdown only.");
     return SCS_RESULT_ok;
 }
 

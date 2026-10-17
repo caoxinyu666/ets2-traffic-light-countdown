@@ -35,6 +35,9 @@ $GameDirectory = (Resolve-Path -LiteralPath $GameDirectory).Path
 if (-not (Test-Path -LiteralPath (Join-Path $GameDirectory 'bin\win_x64\eurotrucks2.exe'))) {
     throw "不是有效的欧卡 2 游戏目录：$GameDirectory"
 }
+if (Get-Process -Name eurotrucks2 -ErrorAction SilentlyContinue) {
+    throw '欧卡 2 仍在运行。请先退出游戏，再运行安装脚本。'
+}
 $pluginDir = Join-Path $GameDirectory 'bin\win_x64\plugins'
 New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
 
