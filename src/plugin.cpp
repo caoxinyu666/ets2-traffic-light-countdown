@@ -148,9 +148,13 @@ LiveLight findLiveLight(double x, double z, double heading) {
         const double dx = r.x - x, dz = r.z - z;
         const double ahead = dx * forwardX + dz * forwardZ;
         const double lateral = std::abs(dx * forwardZ - dz * forwardX);
-        const double lateralLimit = std::min(30.0, std::max(18.0, ahead * 0.12));
-        if (ahead < 2 || ahead > settings.detectionDistance || lateral > lateralLimit) continue;
-        const double score = ahead + lateral * 2;
+        // The telemetry position is the truck's origin, while signal actors can
+        // sit beside or just behind the cab when stopped at a junction.
+        const double lateralLimit = std::min(38.0, 22.0 + std::max(0.0, ahead) * 0.08);
+        if (ahead < -8 || ahead > settings.detectionDistance || lateral > lateralLimit) continue;
+        // Keep a lamp behind the truck only while it is still at the stop line.
+        if (ahead < 0 && std::hypot(dx, dz) > 28.0) continue;
+        const double score = std::max(0.0, ahead) + lateral * 2 + (ahead < 0 ? 20.0 : 0.0);
         if (score < bestScore) {
             bestScore = score;
             best = {r.state == 8 ? LightGreen : (r.state == 2 ? LightRed : LightYellow),
